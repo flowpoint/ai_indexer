@@ -56,7 +56,7 @@ import lmdb
 import numpy as np
 import faiss                   # make faiss available
 import io
-
+import json
 
 model = None
 tokenizer = None
@@ -138,6 +138,11 @@ def build_index(vecs):
 def cli(ctx):
     pass
 
+
+# how much to fill they keys
+# this allows 10^32 db-entries
+fill_depth = 32
+
 @cli.command()
 @click.argument('query', type=str)
 @click.pass_context
@@ -148,7 +153,7 @@ def search(ctx, query):
         vecs = np.array(data['arr_0'])
     '''
 
-    vecs = []
+    uvecs = []
     with env.begin(buffers=True) as txn:
         cursor = txn.cursor()
 
@@ -160,24 +165,28 @@ def search(ctx, query):
             ffp.write(record['vec'])
             ffp.seek(0)
             v = np.loadtxt(ffp)
-            vecs.append(np.expand_dims(v, 0))
-            #print(f'{nidx}: {filename}')
+            idx = bytes(k).decode('utf-8')
+            uvecs.append((idx, np.expand_dims(v, 0)))
 
+    
+    #vecs = [x[1] for x in sorted(uvecs, key=lambda x: x[0])]
+    vecs = [x[1] for x in uvecs]
+
+    print(len(vecs))
 
     index = build_index(vecs)
-
     search_batch = search_2(index, query)
-    for sb in search_batch:
-        neighs = sb
+
+    for neighs in search_batch:
         for nidx, n in enumerate(neighs):
             with env.begin(buffers=True) as txn:
-                b = txn.get(str(n).encode('utf-8'))
+                kvk = str(n).zfill(fill_depth).encode('utf-8')
+                b = txn.get(kvk)
                 s = bytes(b).decode('utf-8')
                 record = json.loads(s)
                 filename = record['fname']
-                print(f'{nidx}: {filename}')
+                print(f'{nidx}: {n} {filename}')
 
-import json
 
 @cli.command()
 @click.argument('pdf_files', type=click.File('r'))
@@ -199,7 +208,7 @@ def index(ctx, pdf_files):
 
     for i, (f,ve) in enumerate(zip(files, vecs)):
         with env.begin(write=True, buffers=True) as txn:
-            k = str(i).encode('utf-8')
+            k = str(i).zfill(fill_depth).encode('utf-8')
             ffp = io.StringIO()
             np.savetxt(ffp, ve)
             ffp.seek(0)
