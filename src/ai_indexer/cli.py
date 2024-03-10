@@ -55,6 +55,8 @@ import subprocess
 import lmdb
 import numpy as np
 import faiss                   # make faiss available
+import io
+
 
 model = None
 tokenizer = None
@@ -141,8 +143,26 @@ def cli(ctx):
 @click.pass_context
 def search(ctx, query):
     env = lmdb.open('db.lmdb')
+    '''
     with np.load('vec_db.npz') as data:
         vecs = np.array(data['arr_0'])
+    '''
+
+    vecs = []
+    with env.begin(buffers=True) as txn:
+        cursor = txn.cursor()
+
+        for k, val in iter(cursor):
+            b = val
+            s = bytes(b).decode('utf-8')
+            record = json.loads(s)
+            ffp = io.StringIO()
+            ffp.write(record['vec'])
+            ffp.seek(0)
+            v = np.loadtxt(ffp)
+            vecs.append(np.expand_dims(v, 0))
+            #print(f'{nidx}: {filename}')
+
 
     index = build_index(vecs)
 
@@ -151,10 +171,13 @@ def search(ctx, query):
         neighs = sb
         for nidx, n in enumerate(neighs):
             with env.begin(buffers=True) as txn:
-                filename = bytes(txn.get(str(n).encode('utf-8'))).decode('utf-8')
+                b = txn.get(str(n).encode('utf-8'))
+                s = bytes(b).decode('utf-8')
+                record = json.loads(s)
+                filename = record['fname']
                 print(f'{nidx}: {filename}')
 
-
+import json
 
 @cli.command()
 @click.argument('pdf_files', type=click.File('r'))
@@ -170,13 +193,20 @@ def index(ctx, pdf_files):
 
     env = lmdb.open('db.lmdb')
 
-    if not Path('vec_db.npz').exists():
-        vecs = build_index_embeds(files)
-        np.savez_compressed('vec_db.npz', np.stack(vecs))
+    #if not Path('vec_db.npz').exists():
+    vecs = build_index_embeds(files)
+    #np.savez_compressed('vec_db.npz', np.stack(vecs))
+
+    for i, (f,ve) in enumerate(zip(files, vecs)):
         with env.begin(write=True, buffers=True) as txn:
-            for i, f in enumerate(files):
-                txn.put(str(i).encode('utf-8'),str(f).encode('utf-8'))
-                print(i)
+            k = str(i).encode('utf-8')
+            ffp = io.StringIO()
+            np.savetxt(ffp, ve)
+            ffp.seek(0)
+            record = {'fname':str(f), 'vec':str(ffp.read())}
+            vall = json.dumps(record).encode('utf-8')
+            txn.put(k,vall)
+            print(i)
 
     #vecs = np.load('vec_db.npz')
     #index = build_index(vecs)
