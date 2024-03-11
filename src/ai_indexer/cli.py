@@ -69,18 +69,19 @@ def format_text(texts, type_):
     else:
         raise RuntimeError(f'unkown format {type_}')
     
+device = 'cpu'
 
 def embed(texts, type_):
     global model
     global tokenizer
     if model is None:
-        model = AutoModel.from_pretrained('intfloat/e5-small-v2')
+        model = AutoModel.from_pretrained('intfloat/e5-small-v2').to(device)
     if tokenizer is None:
         tokenizer = AutoTokenizer.from_pretrained('intfloat/e5-small-v2')
 
 
     input_texts = format_text(texts, type_)
-    batch_dict = tokenizer(input_texts, max_length=512, padding=True, truncation=True, return_tensors='pt')
+    batch_dict = tokenizer(input_texts, max_length=512, padding=True, truncation=True, return_tensors='pt').to(device)
 
     outputs = model(**batch_dict)
     embeddings = average_pool(outputs.last_hidden_state, batch_dict['attention_mask'])
@@ -90,7 +91,7 @@ def embed(texts, type_):
 
 
 def search_2(index, query, topk=3):
-    qemb = embed([query], 'query')
+    qemb = embed([query], 'query').to('cpu')
     #print(qemb.shape)
     qembt = qemb.float().detach().numpy()
     dist, n_idx = index.search(qembt, topk)
@@ -110,7 +111,7 @@ def build_index_embeds(files: list[str]) -> list[np.array]:
         txt = res.stdout
         batch.append(txt)
         if len(batch) > bs:
-            embs.extend(embed(batch, 'passage'))
+            embs.extend(embed(batch, 'passage').to('cpu'))
             batch = []
 
     embs.extend(embed(batch, 'passage'))
@@ -153,7 +154,7 @@ def search(ctx, query):
         vecs = np.array(data['arr_0'])
     '''
 
-    uvecs = []
+    vecs = []
     with env.begin(buffers=True) as txn:
         cursor = txn.cursor()
 
@@ -166,13 +167,7 @@ def search(ctx, query):
             ffp.seek(0)
             v = np.loadtxt(ffp)
             idx = bytes(k).decode('utf-8')
-            uvecs.append((idx, np.expand_dims(v, 0)))
-
-    
-    #vecs = [x[1] for x in sorted(uvecs, key=lambda x: x[0])]
-    vecs = [x[1] for x in uvecs]
-
-    print(len(vecs))
+            vecs.append(np.expand_dims(v, 0))
 
     index = build_index(vecs)
     search_batch = search_2(index, query)
