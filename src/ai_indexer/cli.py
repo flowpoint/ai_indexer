@@ -57,6 +57,7 @@ import numpy as np
 import faiss                   # make faiss available
 import io
 import json
+from more_itertools import chunked, flatten
 
 model = None
 tokenizer = None
@@ -69,7 +70,7 @@ def format_text(texts, type_):
     else:
         raise RuntimeError(f'unkown format {type_}')
     
-device = 'cpu'
+device = 'cuda'
 
 def embed(texts, type_):
     global model
@@ -79,21 +80,26 @@ def embed(texts, type_):
     if tokenizer is None:
         tokenizer = AutoTokenizer.from_pretrained('intfloat/e5-small-v2')
 
+    bs = 1
+    embeddings = []
 
-    input_texts = format_text(texts, type_)
-    batch_dict = tokenizer(input_texts, max_length=512, padding=True, truncation=True, return_tensors='pt').to(device)
+    for batch in chunked(texts, bs):
+        input_texts = format_text(batch, type_)
+        batch_dict = tokenizer(input_texts, max_length=512, padding=True, truncation=True, return_tensors='pt')
+        batch_dict = {k:x.to(device) for k,x in batch_dict.items()}
 
-    outputs = model(**batch_dict)
-    embeddings = average_pool(outputs.last_hidden_state, batch_dict['attention_mask'])
+        outputs = model(**batch_dict)
+        eee = average_pool(outputs.last_hidden_state, batch_dict['attention_mask'])
+        embeddings.append(eee)
 
-    return embeddings
+    return [x.float().to('cpu').detach().numpy() for x in flatten(embeddings)]
 
 
 
 def search_2(index, query, topk=3):
-    qemb = embed([query], 'query').to('cpu')
+    qemb = np.array(embed([query], 'query'))
     #print(qemb.shape)
-    qembt = qemb.float().detach().numpy()
+    qembt = qemb
     dist, n_idx = index.search(qembt, topk)
     return n_idx
 
@@ -111,7 +117,7 @@ def build_index_embeds(files: list[str]) -> list[np.array]:
         txt = res.stdout
         batch.append(txt)
         if len(batch) > bs:
-            embs.extend(embed(batch, 'passage').to('cpu'))
+            embs.extend(embed(batch, 'passage'))
             batch = []
 
     embs.extend(embed(batch, 'passage'))
@@ -119,7 +125,7 @@ def build_index_embeds(files: list[str]) -> list[np.array]:
     vecs = []
 
     for emb in embs:
-        vecs.append(emb.float().unsqueeze(0).detach().numpy())
+        vecs.append(np.expand_dims(emb, 0))
 
     return vecs
 
