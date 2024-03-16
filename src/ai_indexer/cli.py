@@ -84,44 +84,54 @@ def embed_batch(texts, type_):
     if tokenizer is None:
         tokenizer = AutoTokenizer.from_pretrained('intfloat/e5-small-v2')
 
-    bs = 1
-    embeddings = []
+    #bs = 1
+    #embeddings = []
 
-    for batch in chunked(texts, bs):
+    # batch across text sizes
+    #for batch in chunked(texts, bs):
+    with torch.no_grad():
+        batch = texts
         input_texts = format_text(batch, type_)
         batch_dict = tokenizer(input_texts, max_length=512, padding=True, truncation=True, return_tensors='pt')
         batch_dict = {k:x.to(device) for k,x in batch_dict.items()}
 
         outputs = model(**batch_dict)
         eee = average_pool(outputs.last_hidden_state, batch_dict['attention_mask'])
-        embeddings.append(eee)
+        #embeddings.append(eee)
 
-    return [x.float().to('cpu').detach().numpy() for x in flatten(embeddings)]
+        #return [x.float().to('cpu').detach().numpy() for x in flatten(eee)]
+        return eee.float().to('cpu').detach().numpy() 
 
 
 
-def search_2(index, query, topk=3):
+def search_2(index, query, topk=5):
     qemb = np.array(embed_batch([query], 'query'))
+    #qemb = np.array(embed_batch([query], 'passage'))
     #print(qemb.shape)
     qembt = qemb
     dist, n_idx = index.search(qembt, topk)
     return n_idx
 
-def file_to_text(fp):
+def file_to_text_splits(fp):
     res = subprocess.run(['pdftotext', str(fp), '/dev/stdout'], text=True, check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
     txt = res.stdout
-    return txt
+    # 512 = max model context
+    for chunk in chunked(str(txt), 512):
+        yield fp, ''.join(chunk)
 
 def build_index_embeds(files: list[str]) -> list[np.array]:
-    bs = 1
+    bs = 16
+    batch = []
 
-    for batch in chunked(files, bs):
-        b = list(batch)
-        ftxt = [file_to_text(f) for f in b]
-        embs = embed_batch(ftxt, 'passage')
-
-        for fname, emb in zip(batch, embs):
-            yield fname, np.expand_dims(emb, 0)
+    # batch of files
+    for f in files:
+        for fn, split in file_to_text_splits(f):
+            batch.append(split)
+            if len(batch) == bs:
+                embs = embed_batch(batch, 'passage')
+                batch = []
+                for emb in embs:
+                    yield fn, np.expand_dims(emb, 0), split
 
 
 def build_index(vecs):
@@ -141,16 +151,16 @@ def cli(ctx):
 # how much to fill they keys
 # this allows 10^32 db-entries
 fill_depth = 32
+max_dbsize = int(1e12)
 
 @cli.command()
 @click.argument('query', type=str)
 @click.pass_context
 def search(ctx, query):
-    env = lmdb.open('db.lmdb')
-    '''
-    with np.load('vec_db.npz') as data:
-        vecs = np.array(data['arr_0'])
-    '''
+    #env = lmdb.open('db.lmdb', map_size=max_dbsize)
+    global max_dbsize
+    env = lmdb.open('db.lmdb', map_size=max_dbsize)
+    print(env.stat())
 
     vecs = []
     with env.begin(buffers=True) as txn:
@@ -178,7 +188,8 @@ def search(ctx, query):
                 s = bytes(b).decode('utf-8')
                 record = json.loads(s)
                 filename = record['fname']
-                print(f'{nidx}: {n} {filename}')
+                t = record['txt']
+                print(f'{nidx}: {n} {filename} {t}')
 
 def stream_files(fp):
     while True:
@@ -189,18 +200,20 @@ def stream_files(fp):
         yield str(filepath)
 
 
+
 def index2(pdf_files):
-    env = lmdb.open('db.lmdb')
+    global max_dbsize
+    env = lmdb.open('db.lmdb', map_size=max_dbsize)
     fst = stream_files(pdf_files)
     vecs = build_index_embeds(fst)
 
-    for i, (f,ve) in enumerate(vecs):
+    for i, (f,ve,t) in enumerate(vecs):
         with env.begin(write=True, buffers=True) as txn:
             k = str(i).zfill(fill_depth).encode('utf-8')
             ffp = io.StringIO()
             np.savetxt(ffp, ve)
             ffp.seek(0)
-            record = {'fname':str(f), 'vec':str(ffp.read())}
+            record = {'fname':str(f), 'vec':str(ffp.read()), 'txt':t}
             vall = json.dumps(record).encode('utf-8')
             txn.put(k,vall)
             print(f)
