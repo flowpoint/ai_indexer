@@ -57,6 +57,7 @@ import numpy as np
 import faiss                   # make faiss available
 import io
 import json
+import torch
 from more_itertools import chunked, flatten
 
 model = None
@@ -70,9 +71,12 @@ def format_text(texts, type_):
     else:
         raise RuntimeError(f'unkown format {type_}')
     
-device = 'cuda'
+if torch.cuda.is_available():
+    device = 'cuda'
+else:
+    device = 'cpu'
 
-def embed(texts, type_):
+def embed_batch(texts, type_):
     global model
     global tokenizer
     if model is None:
@@ -97,45 +101,33 @@ def embed(texts, type_):
 
 
 def search_2(index, query, topk=3):
-    qemb = np.array(embed([query], 'query'))
+    qemb = np.array(embed_batch([query], 'query'))
     #print(qemb.shape)
     qembt = qemb
     dist, n_idx = index.search(qembt, topk)
     return n_idx
 
+def file_to_text(fp):
+    res = subprocess.run(['pdftotext', str(fp), '/dev/stdout'], text=True, check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+    txt = res.stdout
+    return txt
 
 def build_index_embeds(files: list[str]) -> list[np.array]:
-    batch = []
-    embs = []
-    bs = 5
+    bs = 1
 
-    for filepath in files:
-        #print(filepath)
-        #continue
-        res = subprocess.run(['pdftotext', str(filepath), '/dev/stdout'], text=True, check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+    for batch in chunked(files, bs):
+        b = list(batch)
+        ftxt = [file_to_text(f) for f in b]
+        embs = embed_batch(ftxt, 'passage')
 
-        txt = res.stdout
-        batch.append(txt)
-        if len(batch) > bs:
-            embs.extend(embed(batch, 'passage'))
-            batch = []
+        for fname, emb in zip(batch, embs):
+            yield fname, np.expand_dims(emb, 0)
 
-    embs.extend(embed(batch, 'passage'))
-    batch = []
-    vecs = []
-
-    for emb in embs:
-        vecs.append(np.expand_dims(emb, 0))
-
-    return vecs
 
 def build_index(vecs):
     index = faiss.IndexFlatL2(384)   # build the index
-    #vecs = build_index_embeds(files)
-
     for v in vecs:
         index.add(v)
-
     return index
 
 
@@ -188,26 +180,21 @@ def search(ctx, query):
                 filename = record['fname']
                 print(f'{nidx}: {n} {filename}')
 
-
-@cli.command()
-@click.argument('pdf_files', type=click.File('r'))
-@click.pass_context
-def index(ctx, pdf_files):
-    files = []
+def stream_files(fp):
     while True:
-        line = pdf_files.readline()
+        line = fp.readline()
         if not line:
             break
         filepath = Path(line.strip())
-        files.append(str(filepath))
+        yield str(filepath)
 
+
+def index2(pdf_files):
     env = lmdb.open('db.lmdb')
+    fst = stream_files(pdf_files)
+    vecs = build_index_embeds(fst)
 
-    #if not Path('vec_db.npz').exists():
-    vecs = build_index_embeds(files)
-    #np.savez_compressed('vec_db.npz', np.stack(vecs))
-
-    for i, (f,ve) in enumerate(zip(files, vecs)):
+    for i, (f,ve) in enumerate(vecs):
         with env.begin(write=True, buffers=True) as txn:
             k = str(i).zfill(fill_depth).encode('utf-8')
             ffp = io.StringIO()
@@ -216,10 +203,14 @@ def index(ctx, pdf_files):
             record = {'fname':str(f), 'vec':str(ffp.read())}
             vall = json.dumps(record).encode('utf-8')
             txn.put(k,vall)
-            print(i)
+            print(f)
 
-    #vecs = np.load('vec_db.npz')
-    #index = build_index(vecs)
+
+@cli.command()
+@click.argument('pdf_files', type=click.File('r'))
+@click.pass_context
+def index(ctx, pdf_files):
+    index2(pdf_files)
 
 if __name__ == '__main__':
     cli()

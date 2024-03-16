@@ -24,6 +24,7 @@ dependencies = [
     'lmdb',
     'transformers',
     'faiss-cpu',
+    'more_itertools',
 ]
 
 [project.optional-dependencies]
