@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "ai_indexer"
 version = "0.0.1"
 authors = [
-  { name="flowpoint", email="" },
+  { name="flowpoint" },
 ]
 description = "a small ai indexing and search tool"
 readme = "readme.md"
