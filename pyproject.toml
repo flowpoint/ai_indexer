@@ -6,9 +6,9 @@ build-backend = "setuptools.build_meta"
 name = "ai_indexer"
 version = "0.0.1"
 authors = [
-  { name="flowpoint", email="flowpoint@protonmail.com" },
+  { name="flowpoint", email="" },
 ]
-description = "a minimal build system tool"
+description = "a small ai indexing and search tool"
 readme = "readme.md"
 requires-python = ">=3.8"
 classifiers = [
@@ -16,7 +16,6 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
-keywords = ["key1"]
 license = {text = "MIT License"}
 dependencies = [
     'click',

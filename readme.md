@@ -1,8 +1,17 @@
-# aigrep
+# ai_indexer
 
-requires pdftotext command to be available
-requires lmdb
+a small tool for semantic indexing and searching
 
-QUERY='codellama'
+* only pdfs for now
+* requires pdftotext command to be available
+* requires lmdb
 
-ls ~/Documents/*.pdf | ai_indexer - $QUERY
+## install
+
+pip install .
+
+## index:
+
+ls ~/Documents/*.pdf | ai_indexer index -
+
+ai_indexer search 'hello'
