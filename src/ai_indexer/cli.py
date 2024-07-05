@@ -13,10 +13,13 @@ import io
 import json
 from more_itertools import chunked, flatten
 
-model_name = 'intfloat/e5-small-v2'
+#model_name = 'intfloat/e5-small-v2'
+model_name = 'intfloat/e5-mistral-7b-instruct'
 db_path = './db.lmdb'
 model = None
 tokenizer = None
+embedding_size = 4096
+#embedding_size = 384
 
 if torch.cuda.is_available():
     device = 'cuda'
@@ -44,7 +47,7 @@ def embed_batch(texts, type_):
     global model
     global tokenizer
     if model is None:
-        model = AutoModel.from_pretrained(model_name).to(device)
+                model = AutoModel.from_pretrained(model_name, torch_dtype=torch.float16).to(device)
     if tokenizer is None:
         tokenizer = AutoTokenizer.from_pretrained(model_name)
 
@@ -72,7 +75,8 @@ def file_to_text_splits(fp):
         yield fp, ''.join(chunk)
 
 def build_index_embeds(files: list[str]) -> list[np.array]:
-    bs = 16
+    #bs = 16
+    bs = 1
     batch = []
 
     # batch of files
@@ -87,7 +91,7 @@ def build_index_embeds(files: list[str]) -> list[np.array]:
 
 
 def build_index(vecs):
-    index = faiss.IndexFlatL2(384)
+    index = faiss.IndexFlatL2(embedding_size)
     for v in vecs:
         index.add(v)
     return index
