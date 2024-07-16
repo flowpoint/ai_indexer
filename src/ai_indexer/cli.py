@@ -9,32 +9,73 @@ import subprocess
 import lmdb
 import numpy as np
 import faiss
+from faiss import write_index, read_index
 import io
 import json
+import sys
+from time import time
 from more_itertools import chunked, flatten
 
 #model_name = 'intfloat/e5-small-v2'
 model_name = 'intfloat/e5-mistral-7b-instruct'
-db_path = './db.lmdb'
+# the index here is the faiss index and the db together
+index_folder = Path('./index')
+db_path = index_folder / Path('db.lmdb')
+faiss_file = index_folder / Path('faiss.index')
+
 model = None
 tokenizer = None
 embedding_size = 4096
 #embedding_size = 384
+
+# how much to fill they keys
+# this allows 10^32 db-entries
+fill_depth = 32
+max_dbsize = int(1e12)
 
 if torch.cuda.is_available():
     device = 'cuda'
 else:
     device = 'cpu'
 
+# e5-small-v2 formatting/pooling
 
 # max ctx len is 512 for large-unsupervised
 def average_pool(last_hidden_states: Tensor,
                  attention_mask: Tensor) -> Tensor:
     last_hidden = last_hidden_states.masked_fill(~attention_mask[..., None].bool(), 0.0)
     return last_hidden.sum(dim=1) / attention_mask.sum(dim=1)[..., None]
+# ----
+
+# mistral-7b formatting/pooling
+
+def last_token_pool(last_hidden_states: Tensor,
+                 attention_mask: Tensor) -> Tensor:
+    left_padding = (attention_mask[:, -1].sum() == attention_mask.shape[0])
+    if left_padding:
+        return last_hidden_states[:, -1]
+    else:
+        sequence_lengths = attention_mask.sum(dim=1) - 1
+        batch_size = last_hidden_states.shape[0]
+        return last_hidden_states[torch.arange(batch_size, device=last_hidden_states.device), sequence_lengths]
 
 
+def get_detailed_instruct(task_description: str, query: str) -> str:
+    return f'Instruct: {task_description}\nQuery: {query}'
+
+# Each query must come with a one-sentence instruction that describes the task
+task = 'Given a web search query, retrieve relevant passages that answer the query'
 def format_text(texts, type_):
+    if type_ == 'passage':
+        return [f'{t}' for t in texts]
+    elif type_ == 'query':
+        return [str(get_detailed_instruct(task, t)) for t in texts]
+    else:
+        raise RuntimeError(f'unkown format {type_}')
+
+# ----
+
+def format_text2(texts, type_):
     if type_ == 'passage':
         return [f'passage: {t}' for t in texts]
     elif type_ == 'query':
@@ -47,7 +88,10 @@ def embed_batch(texts, type_):
     global model
     global tokenizer
     if model is None:
-                model = AutoModel.from_pretrained(model_name, torch_dtype=torch.float16).to(device)
+        if device == 'cuda':
+            model = AutoModel.from_pretrained(model_name, torch_dtype=torch.float16, load_in_4bit=True)#.to(device)
+        else:
+            model = AutoModel.from_pretrained(model_name).to(device)
     if tokenizer is None:
         tokenizer = AutoTokenizer.from_pretrained(model_name)
 
@@ -58,9 +102,11 @@ def embed_batch(texts, type_):
         batch_dict = {k:x.to(device) for k,x in batch_dict.items()}
 
         outputs = model(**batch_dict)
-        eee = average_pool(outputs.last_hidden_state, batch_dict['attention_mask'])
+        #eee = average_pool(outputs.last_hidden_state, batch_dict['attention_mask'])
+        eee = last_token_pool(outputs.last_hidden_state, batch_dict['attention_mask'])
 
         return eee.float().to('cpu').detach().numpy() 
+
 
 def search_faiss(index, query, topk=5):
     qemb = np.array(embed_batch([query], 'query'))
@@ -74,20 +120,24 @@ def file_to_text_splits(fp):
     for chunk in chunked(str(txt), 512):
         yield fp, ''.join(chunk)
 
-def build_index_embeds(files: list[str]) -> list[np.array]:
-    #bs = 16
-    bs = 1
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
+
+def build_index_embeds(files: list[str], bs=16) -> list[np.array]:
     batch = []
 
     # batch of files
     for f in files:
-        for fn, split in file_to_text_splits(f):
-            batch.append(split)
-            if len(batch) == bs:
-                embs = embed_batch(batch, 'passage')
-                batch = []
-                for emb in embs:
-                    yield fn, np.expand_dims(emb, 0), split
+        try:
+            for fn, split in file_to_text_splits(f):
+                batch.append(split)
+                if len(batch) == bs:
+                    embs = embed_batch(batch, 'passage')
+                    batch = []
+                    for emb in embs:
+                        yield fn, np.expand_dims(emb, 0), split
+        except Exception as e:
+            eprint(f'error {e} with file {f}')
 
 
 def build_index(vecs):
@@ -97,19 +147,7 @@ def build_index(vecs):
     return index
 
 
-
-
-
-# how much to fill they keys
-# this allows 10^32 db-entries
-fill_depth = 32
-max_dbsize = int(1e12)
-
-def search_query(query):
-    global max_dbsize
-    env = lmdb.open(db_path, map_size=max_dbsize)
-
-    vecs = []
+def read_vectors_from_db(env):
     with env.begin(buffers=True) as txn:
         cursor = txn.cursor()
 
@@ -122,11 +160,30 @@ def search_query(query):
             ffp.seek(0)
             v = np.loadtxt(ffp)
             idx = bytes(k).decode('utf-8')
-            vecs.append(np.expand_dims(v, 0))
+            vec = np.expand_dims(v, 0)
+            yield vec
 
-    index = build_index(vecs)
-    search_batch = search_faiss(index, query)
+def search_query(query, topk):
+    global max_dbsize
+    env = lmdb.open(str(db_path), map_size=max_dbsize)
 
+    if not faiss_file.exists():
+        eprint('faiss index not present building it from db')
+        vecs = list(read_vectors_from_db(env))
+        faiss_index = build_index(vecs)
+        write_index(faiss_index, str(faiss_file))
+    else:
+        faiss_index = read_index(str(faiss_file))
+
+    if faiss_index.ntotal < env.stat()['entries']:
+        eprint('faiss index out of date, rebuilding it from db')
+        vecs = list(read_vectors_from_db(env))
+        faiss_index = build_index(vecs)
+        write_index(faiss_index, str(faiss_file))
+
+    search_batch = search_faiss(faiss_index, query, topk)
+
+    st = time()
     results = []
     for neighs in search_batch:
         for nidx, n in enumerate(neighs):
@@ -137,7 +194,10 @@ def search_query(query):
                 record = json.loads(s)
                 filename = record['fname']
                 t = record['txt']
-                results.append([nidx, n, filename, t])
+                results.append([int(nidx), int(n), str(filename), str(t)])
+
+    et = time()
+    eprint(f'knn search took roughly: {et-st} seconds')
 
     return results
 
@@ -154,7 +214,7 @@ def stream_files(fp):
 
 def index_files(pdf_files):
     global max_dbsize
-    env = lmdb.open('db.lmdb', map_size=max_dbsize)
+    env = lmdb.open(str(db_path), map_size=max_dbsize)
     fst = stream_files(pdf_files)
     vecs = build_index_embeds(fst)
 
@@ -167,7 +227,9 @@ def index_files(pdf_files):
             record = {'fname':str(f), 'vec':str(ffp.read()), 'txt':t}
             vall = json.dumps(record).encode('utf-8')
             txn.put(k,vall)
+            # print file, to show it has been indexed to db
             print(f)
+
 
 @click.group()
 @click.pass_context
@@ -176,11 +238,13 @@ def cli(ctx):
 
 @cli.command()
 @click.argument('query', type=str)
+@click.option('-k', '--topk', type=int, default=5)
 @click.pass_context
-def search(ctx, query):
-    for res in search_query(query):
+def search(ctx, query, topk):
+    for res in search_query(query, topk):
         nidx, n, filename, t = res
         print(f'{nidx}: {n} {filename} {t}')
+
 
 @cli.command()
 @click.argument('pdf_files', type=click.File('r'))
