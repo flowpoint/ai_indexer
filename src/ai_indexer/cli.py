@@ -14,10 +14,10 @@ import io
 import json
 import sys
 from time import time
-from more_itertools import chunked, flatten
+from more_itertools import chunked, flatten, batched
 
-#model_name = 'intfloat/e5-small-v2'
-model_name = 'intfloat/e5-mistral-7b-instruct'
+model_type = None
+model_name = None
 # the index here is the faiss index and the db together
 index_folder = Path('./index')
 db_path = index_folder / Path('db.lmdb')
@@ -28,20 +28,14 @@ verbosity = 1
 model = None
 tokenizer = None
 faiss_index = None
-embedding_size = 4096
-#embedding_size = 384
+embedding_size = None
 
 # how much to fill they keys
 # this allows 10^32 db-entries
 fill_depth = 32
 max_dbsize = int(1e12)
 
-device = 'auto'
-
-if torch.cuda.is_available():
-    device = 'cuda'
-else:
-    device = 'cpu'
+device = None
 
 # e5-small-v2 formatting/pooling
 
@@ -87,20 +81,43 @@ def format_text2(texts, type_):
         return [f'query: {t}' for t in texts]
     else:
         raise RuntimeError(f'unkown format {type_}')
-    
+   
 
-def embed_batch(texts, type_):
+def set_model(model_type_):
+    global model_type
+    global embedding_size
+    global model_name
+
+    model_type = model_type_
+
+    if model_type == 'big':
+        model_name = 'intfloat/e5-mistral-7b-instruct'
+        embedding_size = 4096
+    elif model_type == 'small':
+        model_name = 'intfloat/e5-small-v2'
+        embedding_size = 384
+    else:
+        raise RuntimeError(f'unknown model type {model_type}')
+
+
+def load_model():
     global model
     global tokenizer
+    global embedding_size
+
     if model is None:
         if device == 'cuda':
             model = AutoModel.from_pretrained(model_name, torch_dtype=torch.float16, load_in_4bit=True)#.to(device)
+            # compiling had issues
+            #model = torch.compile(model)
         else:
             model = AutoModel.from_pretrained(model_name, torch_dtype=torch.float16).to(device)
             model = torch.compile(model)
     if tokenizer is None:
         tokenizer = AutoTokenizer.from_pretrained(model_name)
 
+def embed_batch(texts, type_):
+    load_model()
     with torch.no_grad():
         batch = texts
         input_texts = format_text(batch, type_)
@@ -108,8 +125,11 @@ def embed_batch(texts, type_):
         batch_dict = {k:x.to(device) for k,x in batch_dict.items()}
 
         outputs = model(**batch_dict)
-        #eee = average_pool(outputs.last_hidden_state, batch_dict['attention_mask'])
-        eee = last_token_pool(outputs.last_hidden_state, batch_dict['attention_mask'])
+
+        if model_type == 'big':
+            eee = last_token_pool(outputs.last_hidden_state, batch_dict['attention_mask'])
+        elif model_type == 'small':
+            eee = average_pool(outputs.last_hidden_state, batch_dict['attention_mask'])
 
         return eee.float().to('cpu').detach().numpy() 
 
@@ -119,36 +139,46 @@ def search_faiss(index, query, topk=5):
     dist, n_idx = index.search(qemb, topk)
     return n_idx
 
-def file_to_text_splits(fp):
-    if f.endswith('pdf'):
-        res = subprocess.run(['pdftotext', str(fp), '/dev/stdout'], text=True, check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
-        txt = res.stdout
-    elif f.endswith('.txt') or f.endswith('.md'):
-        with open(f, 'r') as f:
-            txt = f.read()
-    # 512 = max model context
-    for chunk in chunked(str(txt), 512):
-        yield fp, ''.join(chunk)
+def file_to_text_splits(file_: str):
+    file = Path(file_)
+    try:
+        if file.name.endswith('pdf'):
+            res = subprocess.run(['pdftotext', str(file), '/dev/stdout'], 
+                                 text=True, check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+            txt = res.stdout
+        elif file.name.endswith('.txt') or file.name.endswith('.md'):
+            with file.open('r') as fp:
+                txt = fp.read()
+        # 512 = max model context
+        for chunk in chunked(str(txt), 512):
+            yield str(file), ''.join(chunk)
+    except Exception as e:
+        eprint(f'error {e} with file {str(file)}')
 
 def eprint(*args, **kwargs):
     if verbosity >= 1:
         print(*args, file=sys.stderr, **kwargs)
 
-def build_index_embeds(files: list[str], bs=128) -> list[np.array]:
-    batch = []
 
+def build_index_embeds(files: list[str], bs=128) -> list[np.array]:
     # batch of files
-    for f in files:
+    for batch in batched(flatten(map(file_to_text_splits, files)), bs):
         try:
-            for fn, split in file_to_text_splits(f):
-                batch.append(split)
-                if len(batch) == bs:
-                    embs = embed_batch(batch, 'passage')
-                    for emb, ssplit in zip(embs, batch):
-                        yield fn, np.expand_dims(emb, 0), ssplit
-                    batch = []
+            #for batch in batched(file_to_text_splits(Path(f)), bs):
+            unpadded_len = len(batch)
+            if unpadded_len == bs:
+                pbatch = batch
+            else:
+                # pad the batch
+                pbatch = list(batch) + ['', ''] * (bs-unpadded_len)
+
+            filenames, splits = zip(*batch)
+            embs = embed_batch(splits, 'passage')
+            for emb, filename, split, _ in zip(embs, filenames, splits, range(unpadded_len)):
+                yield filename, np.expand_dims(emb, 0), split
         except Exception as e:
-            eprint(f'error {e} with file {f}')
+            eprint(f'error {e} embedding batch {str(batch)}')
+            raise(e)
 
 
 def build_index(vecs):
@@ -183,23 +213,21 @@ def build_and_write_index(env, faiss_file):
 
 def search_query(query, topk):
     global max_dbsize
-    env = lmdb.open(str(db_path), map_size=max_dbsize)
-
     global faiss_index
+
+    env = lmdb.open(str(db_path), map_size=max_dbsize)
 
     if faiss_index is not None:
         # skip because index is loaded
         pass
     elif not faiss_file.exists():
-        eprint('faiss index not present building it from db')
-        faiss_index = build_and_write_index(env, faiss_file)
+        raise RuntimeError('error: faiss index not found, consider rebuilding')
     else:
         faiss_index = read_index(str(faiss_file))
         if faiss_index.ntotal < env.stat()['entries']:
-            eprint('faiss index out of date, rebuilding it from db')
-            faiss_index = build_and_write_index(env, faiss_file)
+            raise RuntimeError('error: faiss index too small. consider rebuilding')
 
-    assert faiss_index.ntotal >= env.stat()['entries'], 'faiss index too small and not rebuilt. ensure the index isnt changed during use'
+    assert faiss_index.ntotal == env.stat()['entries'], 'the number of faiss vectors and phrases does not match'
 
     search_batch = search_faiss(faiss_index, query, topk)
 
@@ -232,11 +260,12 @@ def stream_files(fp):
 
 
 
-def index_files(pdf_files):
+def index_files(pdf_files, batch_size):
     global max_dbsize
     env = lmdb.open(str(db_path), map_size=max_dbsize)
     fst = stream_files(pdf_files)
-    vecs = build_index_embeds(fst)
+    vecs = build_index_embeds(fst, batch_size)
+    eprint('start indexing files')
 
     for i, (f,ve,t) in enumerate(vecs):
         with env.begin(write=True, buffers=True) as txn:
@@ -249,19 +278,39 @@ def index_files(pdf_files):
             txn.put(k,vall)
             # print file, to show it has been indexed to db
             if verbosity >= 1:
-                print(f)
+                print(str(f))
+
+    eprint('indexing files done')
+    eprint('assembling search index')
+    global faiss_index
+    faiss_index = build_and_write_index(env, faiss_file)
 
 
-@click.group()
+
+CONTEXT_SETTINGS = dict(help_option_names=['-h', '--help'])
+
+@click.group(context_settings=CONTEXT_SETTINGS)
 @click.pass_context
-def cli(ctx):
-    pass
+@click.option('-d', '--device', 'device_', type=click.Choice(['auto','cpu','cuda']), default='auto')
+@click.option('-m', '--model_type', 'model_type_', type=click.Choice(['small','big']), default='big')
+def cli(ctx, device_, model_type_):
+    ''' a simple semantic search cli tool '''
+    global device
+
+    if device_ == 'auto':
+        if torch.cuda.is_available():
+            device = 'cuda'
+        else:
+            device = 'cpu'
+
+    set_model(model_type_)
 
 @cli.command()
 @click.argument('query', type=str)
 @click.option('-k', '--topk', type=int, default=5)
 @click.pass_context
 def search(ctx, query, topk):
+    ''' search a semantic document index '''
     global max_dbsize
     env = lmdb.open(str(db_path), map_size=max_dbsize)
     #print(env.stat()['entries'])
@@ -273,9 +322,11 @@ def search(ctx, query, topk):
 
 @cli.command()
 @click.argument('pdf_files', type=click.File('r'))
+@click.option('-b', '--batch_size', type=int, default=128)
 @click.pass_context
-def index(ctx, pdf_files):
-    index_files(pdf_files)
+def index(ctx, pdf_files, batch_size):
+    ''' build a semantic document index '''
+    index_files(pdf_files, batch_size)
 
 
 if __name__ == '__main__':

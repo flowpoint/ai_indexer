@@ -2,16 +2,28 @@
 
 a small tool for semantic indexing and searching
 
-* only pdfs for now
+* only pdfs, txt and .md for now
 * requires pdftotext command to be available
 * requires lmdb
 
 ## install
 
+```
 pip install .
+```
 
-## index:
+## usage
 
-ls ~/Documents/*.pdf | ai_indexer index -
+index some files.
+for each embedded chunk, the filename will be printed to stdout consecutively.
+at the end, the index will be "assembled"
 
+```
+ls ~/Documents/*.pdf ~/Documents/*.txt | ai_indexer index -
+```
+
+search the index.
+
+```
 ai_indexer search 'hello'
+```
