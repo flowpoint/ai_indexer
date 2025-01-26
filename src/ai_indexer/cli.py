@@ -23,8 +23,11 @@ index_folder = Path('./index')
 db_path = index_folder / Path('db.lmdb')
 faiss_file = index_folder / Path('faiss.index')
 
+verbosity = 1
+
 model = None
 tokenizer = None
+faiss_index = None
 embedding_size = 4096
 #embedding_size = 384
 
@@ -32,6 +35,8 @@ embedding_size = 4096
 # this allows 10^32 db-entries
 fill_depth = 32
 max_dbsize = int(1e12)
+
+device = 'auto'
 
 if torch.cuda.is_available():
     device = 'cuda'
@@ -91,7 +96,8 @@ def embed_batch(texts, type_):
         if device == 'cuda':
             model = AutoModel.from_pretrained(model_name, torch_dtype=torch.float16, load_in_4bit=True)#.to(device)
         else:
-            model = AutoModel.from_pretrained(model_name).to(device)
+            model = AutoModel.from_pretrained(model_name, torch_dtype=torch.float16).to(device)
+            model = torch.compile(model)
     if tokenizer is None:
         tokenizer = AutoTokenizer.from_pretrained(model_name)
 
@@ -114,16 +120,21 @@ def search_faiss(index, query, topk=5):
     return n_idx
 
 def file_to_text_splits(fp):
-    res = subprocess.run(['pdftotext', str(fp), '/dev/stdout'], text=True, check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
-    txt = res.stdout
+    if f.endswith('pdf'):
+        res = subprocess.run(['pdftotext', str(fp), '/dev/stdout'], text=True, check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+        txt = res.stdout
+    elif f.endswith('.txt') or f.endswith('.md'):
+        with open(f, 'r') as f:
+            txt = f.read()
     # 512 = max model context
     for chunk in chunked(str(txt), 512):
         yield fp, ''.join(chunk)
 
 def eprint(*args, **kwargs):
-    print(*args, file=sys.stderr, **kwargs)
+    if verbosity >= 1:
+        print(*args, file=sys.stderr, **kwargs)
 
-def build_index_embeds(files: list[str], bs=16) -> list[np.array]:
+def build_index_embeds(files: list[str], bs=128) -> list[np.array]:
     batch = []
 
     # batch of files
@@ -133,15 +144,16 @@ def build_index_embeds(files: list[str], bs=16) -> list[np.array]:
                 batch.append(split)
                 if len(batch) == bs:
                     embs = embed_batch(batch, 'passage')
+                    for emb, ssplit in zip(embs, batch):
+                        yield fn, np.expand_dims(emb, 0), ssplit
                     batch = []
-                    for emb in embs:
-                        yield fn, np.expand_dims(emb, 0), split
         except Exception as e:
             eprint(f'error {e} with file {f}')
 
 
 def build_index(vecs):
-    index = faiss.IndexFlatL2(embedding_size)
+    index = faiss.index_factory(embedding_size, 'SQ8')
+    index.train(np.concatenate(vecs[::5]))
     for v in vecs:
         index.add(v)
     return index
@@ -163,23 +175,31 @@ def read_vectors_from_db(env):
             vec = np.expand_dims(v, 0)
             yield vec
 
+def build_and_write_index(env, faiss_file):
+    vecs = list(read_vectors_from_db(env))
+    faiss_index = build_index(vecs)
+    write_index(faiss_index, str(faiss_file))
+    return faiss_index
+
 def search_query(query, topk):
     global max_dbsize
     env = lmdb.open(str(db_path), map_size=max_dbsize)
 
-    if not faiss_file.exists():
+    global faiss_index
+
+    if faiss_index is not None:
+        # skip because index is loaded
+        pass
+    elif not faiss_file.exists():
         eprint('faiss index not present building it from db')
-        vecs = list(read_vectors_from_db(env))
-        faiss_index = build_index(vecs)
-        write_index(faiss_index, str(faiss_file))
+        faiss_index = build_and_write_index(env, faiss_file)
     else:
         faiss_index = read_index(str(faiss_file))
+        if faiss_index.ntotal < env.stat()['entries']:
+            eprint('faiss index out of date, rebuilding it from db')
+            faiss_index = build_and_write_index(env, faiss_file)
 
-    if faiss_index.ntotal < env.stat()['entries']:
-        eprint('faiss index out of date, rebuilding it from db')
-        vecs = list(read_vectors_from_db(env))
-        faiss_index = build_index(vecs)
-        write_index(faiss_index, str(faiss_file))
+    assert faiss_index.ntotal >= env.stat()['entries'], 'faiss index too small and not rebuilt. ensure the index isnt changed during use'
 
     search_batch = search_faiss(faiss_index, query, topk)
 
@@ -228,7 +248,8 @@ def index_files(pdf_files):
             vall = json.dumps(record).encode('utf-8')
             txn.put(k,vall)
             # print file, to show it has been indexed to db
-            print(f)
+            if verbosity >= 1:
+                print(f)
 
 
 @click.group()
@@ -241,9 +262,13 @@ def cli(ctx):
 @click.option('-k', '--topk', type=int, default=5)
 @click.pass_context
 def search(ctx, query, topk):
+    global max_dbsize
+    env = lmdb.open(str(db_path), map_size=max_dbsize)
+    #print(env.stat()['entries'])
     for res in search_query(query, topk):
         nidx, n, filename, t = res
-        print(f'{nidx}: {n} {filename} {t}')
+        if verbosity >= 1:
+            print(f'{nidx}: {n} {filename} {t}')
 
 
 @cli.command()
