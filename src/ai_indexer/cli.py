@@ -1,9 +1,9 @@
-import torch
-import torch.nn.functional as F
-from torch import Tensor
-from transformers import AutoTokenizer, AutoModel
+import tokenizers
+#from transformers import AutoTokenizer
 
+from tqdm import tqdm
 import click
+import zarr
 from pathlib import Path
 import subprocess
 import lmdb
@@ -21,9 +21,13 @@ model_name = None
 # the index here is the faiss index and the db together
 index_folder = Path('./index')
 db_path = index_folder / Path('db.lmdb')
+vectors_path = index_folder / Path('vectors.zarr')
 faiss_file = index_folder / Path('faiss.index')
 
+compile_model = False
+
 verbosity = 1
+dtype = 'float16'
 
 model = None
 tokenizer = None
@@ -37,26 +41,14 @@ max_dbsize = int(1e12)
 
 device = None
 
-# e5-small-v2 formatting/pooling
+def average_pool_np(last_hidden_states: np.ndarray,
+                 attention_mask: np.ndarray) -> np.ndarray:
 
-# max ctx len is 512 for large-unsupervised
-def average_pool(last_hidden_states: Tensor,
-                 attention_mask: Tensor) -> Tensor:
-    last_hidden = last_hidden_states.masked_fill(~attention_mask[..., None].bool(), 0.0)
-    return last_hidden.sum(dim=1) / attention_mask.sum(dim=1)[..., None]
-# ----
+    #assert last_hidden_states.shape[1:] == [512,384]
+    attention_mask2 = ~np.tile(attention_mask[...,None], [1,1,last_hidden_states.shape[-1]]).astype(np.bool_)
 
-# mistral-7b formatting/pooling
-
-def last_token_pool(last_hidden_states: Tensor,
-                 attention_mask: Tensor) -> Tensor:
-    left_padding = (attention_mask[:, -1].sum() == attention_mask.shape[0])
-    if left_padding:
-        return last_hidden_states[:, -1]
-    else:
-        sequence_lengths = attention_mask.sum(dim=1) - 1
-        batch_size = last_hidden_states.shape[0]
-        return last_hidden_states[torch.arange(batch_size, device=last_hidden_states.device), sequence_lengths]
+    last_hidden = np.ma.array(last_hidden_states, mask=attention_mask2, fill_value=0.0).filled()
+    return last_hidden.sum(axis=1) / attention_mask.sum(axis=1)[...,None]
 
 
 def get_detailed_instruct(task_description: str, query: str) -> str:
@@ -90,6 +82,8 @@ def set_model(model_type_):
 
     model_type = model_type_
 
+    embedding_size = 384
+    '''
     if model_type == 'big':
         model_name = 'intfloat/e5-mistral-7b-instruct'
         embedding_size = 4096
@@ -98,6 +92,7 @@ def set_model(model_type_):
         embedding_size = 384
     else:
         raise RuntimeError(f'unknown model type {model_type}')
+    '''
 
 
 def load_model():
@@ -106,32 +101,41 @@ def load_model():
     global embedding_size
 
     if model is None:
-        if device == 'cuda':
-            model = AutoModel.from_pretrained(model_name, torch_dtype=torch.float16, load_in_4bit=True)#.to(device)
-            # compiling had issues
-            #model = torch.compile(model)
-        else:
-            model = AutoModel.from_pretrained(model_name, torch_dtype=torch.float16).to(device)
-            model = torch.compile(model)
-    if tokenizer is None:
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        import onnxruntime
+
+        #model_name = 'intfloat/e5-small-v2'
+        model_name = 'onnx_model_export/intfloat_e5_small_v2'
+        onnx_file = 'onnx_model_export/intfloat_e5_small_v2/model.onnx'
+        ##tokenizer = AutoTokenizer.from_pretrained('intfloat/e5-small-v2')
+        #tokenizer = AutoTokenizer.from_pretrained(model_name)
+        tokenizer = tokenizers.Tokenizer.from_file('onnx_model_export/intfloat_e5_small_v2/tokenizer.json')
+        tokenizer.enable_truncation(512)
+        tokenizer.enable_padding()
+        #model = onnxruntime.InferenceSession(onnx_file)
+        model = onnxruntime.InferenceSession(onnx_file, providers=['TensorrtExecutionProvider', 'CUDAExecutionProvider'])
+        #model = onnxruntime.InferenceSession(onnx_file, providers=['CUDAExecutionProvider'])
+
+
+    #if tokenizer is None:
+        #tokenizer = AutoTokenizer.from_pretrained(model_name)
+        #tokenizer = tokenizers.Tokenizer.from_file('tok1/tokenizers.json')
 
 def embed_batch(texts, type_):
     load_model()
-    with torch.no_grad():
-        batch = texts
-        input_texts = format_text(batch, type_)
-        batch_dict = tokenizer(input_texts, max_length=512, padding=True, truncation=True, return_tensors='pt')
-        batch_dict = {k:x.to(device) for k,x in batch_dict.items()}
+    batch = texts
+    input_texts = format_text(batch, type_)
+    #batch_dict = tokenizer(input_texts, max_length=512, padding=True, truncation=True, return_tensors='np')
+    #batch_dict = dict(tokenizer(input_texts, return_tensors='np'))
+    #batch_dict = dict(tokenizer.encode(input_texts, return_tensors='np'))
+    batch_enc = tokenizer.encode_batch(input_texts)[0]#, return_tensors='np'))
+    batch_dict = {"input_ids":np.array([batch_enc.ids]), "attention_mask":np.array([batch_enc.attention_mask])}
+    #batch_dict = dict(tokenizer(input_texts)), return_tensors='np'))
+    #batch_dict.pop('token_type_ids')
+    outputs = model.run(None, batch_dict)
+    #outputs = model(**batch_dict)
 
-        outputs = model(**batch_dict)
-
-        if model_type == 'big':
-            eee = last_token_pool(outputs.last_hidden_state, batch_dict['attention_mask'])
-        elif model_type == 'small':
-            eee = average_pool(outputs.last_hidden_state, batch_dict['attention_mask'])
-
-        return eee.float().to('cpu').detach().numpy() 
+    eee = average_pool_np(outputs[0], batch_dict['attention_mask'])
+    return eee
 
 
 def search_faiss(index, query, topk=5):
@@ -183,30 +187,13 @@ def build_index_embeds(files: list[str], bs=128) -> list[np.array]:
 
 def build_index(vecs):
     index = faiss.index_factory(embedding_size, 'SQ8')
-    index.train(np.concatenate(vecs[::5]))
-    for v in vecs:
-        index.add(v)
+    index.train(vecs[::5])
+    index.add(vecs)
     return index
 
 
-def read_vectors_from_db(env):
-    with env.begin(buffers=True) as txn:
-        cursor = txn.cursor()
-
-        for k, val in iter(cursor):
-            b = val
-            s = bytes(b).decode('utf-8')
-            record = json.loads(s)
-            ffp = io.StringIO()
-            ffp.write(record['vec'])
-            ffp.seek(0)
-            v = np.loadtxt(ffp)
-            idx = bytes(k).decode('utf-8')
-            vec = np.expand_dims(v, 0)
-            yield vec
-
 def build_and_write_index(env, faiss_file):
-    vecs = list(read_vectors_from_db(env))
+    vecs = zarr.open(str(vectors_path))
     faiss_index = build_index(vecs)
     write_index(faiss_index, str(faiss_file))
     return faiss_index
@@ -227,7 +214,8 @@ def search_query(query, topk):
         if faiss_index.ntotal < env.stat()['entries']:
             raise RuntimeError('error: faiss index too small. consider rebuilding')
 
-    assert faiss_index.ntotal == env.stat()['entries'], 'the number of faiss vectors and phrases does not match'
+    db_ent = env.stat()['entries']
+    assert faiss_index.ntotal == env.stat()['entries'], f'the number of faiss vectors and phrases does not match: {faiss_index.ntotal} {db_ent}'
 
     search_batch = search_faiss(faiss_index, query, topk)
 
@@ -236,6 +224,8 @@ def search_query(query, topk):
     for neighs in search_batch:
         for nidx, n in enumerate(neighs):
             with env.begin(buffers=True) as txn:
+                if n == -1:
+                    continue
                 kvk = str(n).zfill(fill_depth).encode('utf-8')
                 b = txn.get(kvk)
                 s = bytes(b).decode('utf-8')
@@ -267,18 +257,38 @@ def index_files(pdf_files, batch_size):
     vecs = build_index_embeds(fst, batch_size)
     eprint('start indexing files')
 
-    for i, (f,ve,t) in enumerate(vecs):
-        with env.begin(write=True, buffers=True) as txn:
-            k = str(i).zfill(fill_depth).encode('utf-8')
-            ffp = io.StringIO()
-            np.savetxt(ffp, ve)
-            ffp.seek(0)
-            record = {'fname':str(f), 'vec':str(ffp.read()), 'txt':t}
-            vall = json.dumps(record).encode('utf-8')
-            txn.put(k,vall)
-            # print file, to show it has been indexed to db
-            if verbosity >= 1:
-                print(str(f))
+    vec_db = zarr.create_array(store=str(vectors_path), shape=[batch_size, embedding_size], shards=[batch_size, embedding_size],
+                               dtype=dtype, chunks=[batch_size, embedding_size], overwrite=True)
+
+    buf = np.empty([batch_size, embedding_size])
+
+    for i, (f,vec,t) in tqdm(enumerate(vecs)):
+        if i % batch_size == 0:
+            txn = env.begin(write=True, buffers=True)
+            i0 = i
+
+        if i >= vec_db.shape[0]:
+            vec_db.resize((vec_db.shape[0]+batch_size, vec_db.shape[1]))
+        k = str(i).zfill(fill_depth).encode('utf-8')
+        record = {'fname':str(f), 'txt':t}
+        vall = json.dumps(record).encode('utf-8')
+
+        buf[i%batch_size] = vec
+        txn.put(k,vall)
+        # print file, to show it has been indexed to db
+        if verbosity >= 1:
+            print(str(f))
+
+        if i % batch_size == batch_size - 1:
+            vec_db[i0:i+1] = buf
+            txn.commit()
+
+    txn.commit()
+
+    txn = env.begin(write=True, buffers=True)
+    vec_db[i0:i+1] = buf
+    vec_db.resize([i+1,embedding_size])
+    txn.commit()
 
     eprint('indexing files done')
     eprint('assembling search index')
@@ -296,13 +306,7 @@ CONTEXT_SETTINGS = dict(help_option_names=['-h', '--help'])
 def cli(ctx, device_, model_type_):
     ''' a simple semantic search cli tool '''
     global device
-
-    if device_ == 'auto':
-        if torch.cuda.is_available():
-            device = 'cuda'
-        else:
-            device = 'cpu'
-
+    device = 'cuda'
     set_model(model_type_)
 
 @cli.command()
@@ -326,42 +330,17 @@ def search(ctx, query, topk):
 @click.pass_context
 def index(ctx, pdf_files, batch_size):
     ''' build a semantic document index '''
+    global compile_model
+    compile_model = True
     index_files(pdf_files, batch_size)
+
+@cli.command()
+@click.option('-b', '--batch_size', type=int, default=128)
+@click.pass_context
+def build_index2(ctx, batch_size):
+    ''' build a semantic document index '''
+    build_and_write_index(None, faiss_file)
 
 
 if __name__ == '__main__':
     cli()
-
-
-# huggingface usage docs as hint
-''' prompt encoding:
-Here are some rules of thumb:
-
-    Use "query: " and "passage: " correspondingly for asymmetric tasks such as passage retrieval in open QA, ad-hoc information retrieval.
-
-    Use "query: " prefix for symmetric tasks such as semantic similarity, paraphrase retrieval.
-
-    Use "query: " prefix if you want to use embeddings as features, such as linear probing classification, clustering.
-
-# Each input text should start with "query: " or "passage: ".
-# For tasks other than retrieval, you can simply use the "query: " prefix.
-input_texts = ['query: how much protein should a female eat',
-               'query: summit define',
-               "passage: As a general guideline, the CDC's average requirement of protein for women ages 19 to 70 is 46 grams per day. But, as you can see from this chart, you'll need to increase that if you're expecting or training for a marathon. Check out the chart below to see how much protein you should be eating each day.",
-               "passage: Definition of summit for English Language Learners. : 1  the highest point of a mountain : the top of a mountain. : 2  the highest level. : 3  a meeting or series of meetings between the leaders of two or more governments."]
-
-tokenizer = AutoTokenizer.from_pretrained('intfloat/e5-small-v2')
-model = AutoModel.from_pretrained('intfloat/e5-small-v2')
-
-# Tokenize the input texts
-batch_dict = tokenizer(input_texts, max_length=512, padding=True, truncation=True, return_tensors='pt')
-
-outputs = model(**batch_dict)
-embeddings = average_pool(outputs.last_hidden_state, batch_dict['attention_mask'])
-print(embeddings)
-
-# normalize embeddings
-embeddings = F.normalize(embeddings, p=2, dim=1)
-scores = (embeddings[:2] @ embeddings[2:].T) * 100
-print(scores.tolist())
-'''

@@ -19,10 +19,11 @@ classifiers = [
 license = {text = "MIT License"}
 dependencies = [
     'click',
-    'torch',
     'lmdb',
-    'transformers',
+    'tokenizers',
+    'onnxruntime',
     'faiss-cpu',
+    'zarr',
     'more_itertools',
 ]
 
@@ -32,6 +33,15 @@ dev = [
     'python-lsp-server',
     'mypy',
     'pytest',
+]
+
+quality_bench = [
+    'mteb'
+]
+
+flexible = [
+'torch',
+'transformers'
 ]
 
 [project.scripts]
